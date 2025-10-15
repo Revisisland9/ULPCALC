@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 
 # Page configuration (sets window title and layout)
@@ -19,4 +18,8 @@ Use the sidebar on the left to:
 - **🛠️ Admin:** Upload new shipment data, recalibrate the model, and publish new versions.
 
 Each recalibration automatically learns the latest cost behavior across states,
-keeps 95% of shipments in the 10–40% p
+keeps 95% of shipments in the 10–40% profit window, and centers on your 18% target.
+""")  # <-- make sure this closing triple quote and parenthesis are present
+
+# Friendly sidebar message
+st.sidebar.success("Select a page above to begin.")
