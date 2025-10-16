@@ -1,149 +1,128 @@
 # pages/2_🛠️_Admin.py
-import os, sys
+import os
+import sys
+import streamlit as st
+import pandas as pd
+import json
+import traceback
+
+# ----------------------------
+# Ensure project root and import model
+# ----------------------------
 APP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if APP_ROOT not in sys.path:
     sys.path.insert(0, APP_ROOT)
-import io
-import pandas as pd
-import streamlit as st
-mport streamlit as st
+
 try:
     from src.model import load_dataframe, CalibParams, build_version, price_for, price_for_many
 except Exception as e:
-    import traceback
-    st.error("Import failed in Admin page.")
+    st.error("❌ Import failed in Admin page. Here’s the full error trace:")
     st.code(traceback.format_exc())
     st.stop()
-from src.storage import save_upload, publish_version, list_versions, load_version
-from src.ui import zone_table_component, metrics_cards
-
-st.set_page_config(page_title="Admin", page_icon="🛠️", layout="wide")
-st.title("Admin — Upload & Calibrate")
 
 # ----------------------------
-# 1) Upload + Column Mapping
+# Page setup
 # ----------------------------
-with st.expander("1) Upload new actuals (MSRP, Cost to ULP, Destination State)"):
-    up = st.file_uploader("CSV or XLSX", type=["csv","xlsx"])
-    uploaded_path = None
-    msrp_col = cost_col = state_col = None
+st.set_page_config(page_title="🛠️ Admin Calibration", layout="wide")
+st.title("🛠️ Admin Calibration Panel")
 
-    if up is not None:
-        suffix = ".csv" if up.name.lower().endswith(".csv") else ".xlsx"
-        uploaded_path = save_upload(up, suffix)
-        st.success(f"Saved to {uploaded_path}")
-
-        # Show columns and let the user map them explicitly
-        src_preview = pd.read_csv(uploaded_path) if suffix==".csv" else pd.read_excel(uploaded_path)
-        st.caption("Detected columns:")
-        st.write(list(src_preview.columns))
-
-        c1, c2, c3 = st.columns(3)
-        msrp_col  = c1.selectbox("Which column is MSRP?", list(src_preview.columns))
-        cost_col  = c2.selectbox("Which column is Cost to ULP?", list(src_preview.columns))
-        state_col = c3.selectbox("Which column is Destination State?", list(src_preview.columns))
-
-        # Tiny preview of the selected columns
-        prev_cols = src_preview[[msrp_col, cost_col, state_col]].head(10).copy()
-        prev_cols.columns = ["MSRP", "Cost to ULP", "Destination State"]
-        st.dataframe(prev_cols, use_container_width=True)
-
-st.markdown("---")
+st.markdown(
+    """
+    Upload your cost/MSRP/state dataset, set calibration parameters, and run the model.  
+    This page will build the new `(a,b)` multiplier version and show key metrics.
+    """
+)
 
 # ----------------------------
-# 2) Calibration Parameters
+# File uploader
 # ----------------------------
-st.subheader("2) Calibration Parameters")
-c1, c2, c3, c4 = st.columns(4)
-target_mean = c1.number_input("Target Mean Margin", value=0.18, min_value=0.05, max_value=0.50, step=0.01, format="%.2f")
-band_low    = c2.number_input("Band Low", value=0.10, min_value=0.00, max_value=0.40, step=0.01, format="%.2f")
-band_high   = c3.number_input("Band High", value=0.40, min_value=0.10, max_value=0.60, step=0.01, format="%.2f")
-band_target = c4.number_input("Coverage Goal (%% inside band)", value=0.95, min_value=0.80, max_value=0.99, step=0.01, format="%.2f")
+uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
+if uploaded_file:
+    try:
+        df = load_dataframe(uploaded_file)
+        st.success(f"Loaded {len(df):,} rows")
+        st.dataframe(df.head())
+    except Exception as e:
+        st.error("Error loading file:")
+        st.code(traceback.format_exc())
+        st.stop()
+else:
+    st.info("⬆️ Upload a CSV or Excel file to begin.")
+    st.stop()
+
+# ----------------------------
+# Parameter sidebar
+# ----------------------------
+st.sidebar.header("Calibration Parameters")
+
+target_mean = st.sidebar.number_input("Target Mean Margin", value=0.18, step=0.01)
+band_low = st.sidebar.number_input("Band Low", value=0.10, step=0.01)
+band_high = st.sidebar.number_input("Band High", value=0.40, step=0.01)
+band_target = st.sidebar.number_input("Band Target Coverage", value=0.80, step=0.05)
+zones = st.sidebar.slider("Zones (state groupings)", 2, 6, 4)
+iters = st.sidebar.slider("Iterations", 50, 300, 120)
+lr_mean = st.sidebar.slider("Learning Rate (Mean)", 0.05, 0.5, 0.30)
+lr_tail = st.sidebar.slider("Learning Rate (Tail)", 0.05, 0.5, 0.15)
+shrinkage = st.sidebar.slider("Zone Shrinkage", 0.0, 1.0, 0.8)
+change_cap = st.sidebar.slider("Change Cap %", 0.0, 0.2, 0.07)
 
 params = CalibParams(
     target_mean=target_mean,
     band_low=band_low,
     band_high=band_high,
     band_target=band_target,
-    # Temporarily disable the 5% change cap so we can fully re-center
-    change_cap_pct=1.00
+    zones=zones,
+    shrinkage=shrinkage,
+    iters=iters,
+    lr_mean=lr_mean,
+    lr_tail=lr_tail,
+    change_cap_pct=change_cap,
 )
 
-st.markdown("---")
-
 # ----------------------------
-# 3) Recalibrate (Preview)
+# Run calibration
 # ----------------------------
-st.subheader("3) Recalibrate (Preview)")
-colA, colB = st.columns([1,2])
-with colA:
-    run_btn = st.button("Recalibrate with latest upload", type="primary", disabled=(uploaded_path is None or msrp_col is None))
+if st.button("Run Calibration"):
+    with st.spinner("Running calibration... this may take a minute"):
+        try:
+            version, state_map, zone_table = build_version(df, params)
+        except Exception as e:
+            st.error("Error during calibration:")
+            st.code(traceback.format_exc())
+            st.stop()
 
-with colB:
-    st.info("Recalibration learns zones & multipliers from your uploaded actuals. It won’t go live until you Publish.")
+        st.success("✅ Calibration complete")
 
-if run_btn and uploaded_path:
-    # Load the dataframe using the chosen columns (no heuristics)
-    df = load_dataframe(uploaded_path, msrp_col=msrp_col, cost_col=cost_col, state_col=state_col)
+        # Display metrics
+        m = version["metrics"]
+        st.subheader("Calibration Results")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Mean Margin", f"{m['mean_margin']*100:.2f}%")
+        col2.metric("% Inside 10–40%", f"{m['pct_inside']*100:.1f}%")
+        col3.metric("% Below 10%", f"{m['pct_below']*100:.1f}%")
+        col4.metric("% Above 40%", f"{m['pct_above']*100:.1f}%")
 
-    # Quick sanity stats on raw data
-    st.caption(f"Rows after cleaning: {len(df):,}")
-    if len(df):
-        median_ratio = float((df['Cost_to_ULP']/df['MSRP']).median())
-        st.caption(f"Median Cost/MSRP in upload: {median_ratio:.3f} (if this is ~0.90, many lanes are inherently tight)")
+        # Display tables
+        with st.expander("📊 Zone Table"):
+            st.dataframe(zone_table)
 
-    # Build version (zones/ratios), calibrate, normalize, score
-    prev = load_version()
-    version, state_map, zone_table = build_version(df, params, prev)
+        with st.expander("🗺️ State → Zone Map"):
+            st.dataframe(state_map)
 
-    # KPI cards from the model
-    st.success("Calibration complete (preview). Review below.")
-    metrics_cards(version["metrics"])
-    zone_table_component(zone_table)
+        with st.expander("🧮 Zone×Tier Multipliers (a,b)"):
+            st.dataframe(pd.DataFrame(version["zt_multipliers"]))
 
-    # ---------------------------------------
-    # 3b) HARD SANITY: recompute live revenue
-    # ---------------------------------------
-    st.subheader("Sanity Check Against Exported Tables")
-    zones_df = pd.DataFrame(version["zones"]).rename(
-        columns={"zone":"Zone","expected_cost_ratio":"Zone_Expected_Cost_Ratio","multiplier":"Zone_Multiplier"}
-    )
-    state_join = pd.DataFrame(version["state_map"]).rename(columns={"state":"Destination_State","zone":"Zone"})
-    check = (df.merge(state_join, on="Destination_State", how="left")
-               .merge(zones_df, on="Zone", how="left"))
-    check["Predicted_Price"] = check["MSRP"] * check["Zone_Expected_Cost_Ratio"] * check["Zone_Multiplier"]
-    # compute totals and mean
-    total_cost = float(check["Cost_to_ULP"].sum())
-    total_rev  = float(check["Predicted_Price"].sum())
-    mean_margin = float(((check["Predicted_Price"] - check["Cost_to_ULP"]) / check["Cost_to_ULP"]).mean())
+        with st.expander("📐 Tier Normalization"):
+            st.dataframe(pd.DataFrame(version["tier_norm"]))
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Σ Cost", f"${total_cost:,.0f}")
-    c2.metric("Target Σ Revenue", f"${total_cost*(1+params.target_mean):,.0f}")
-    c3.metric("Achieved Σ Revenue", f"${total_rev:,.0f}")
+        # Save JSON for use in Quote/Bulk
+        version_json = json.dumps(version, indent=2)
+        st.download_button(
+            "💾 Download Version JSON",
+            version_json,
+            file_name="version.json",
+            mime="application/json",
+        )
 
-    st.metric("Mean Margin (recomputed from exported tables)", f"{mean_margin*100:.2f}%",
-              help="This should be ~ equal to Target Mean. If not, we know exactly where to look.")
-
-    # Guardrails suggestion (optional)
-    ok_mean = abs(mean_margin - params.target_mean) <= 0.01
-    ok_band = version["metrics"]["pct_inside"] >= params.band_target - 0.01
-    if not (ok_mean and ok_band):
-        st.warning("Guardrails not met (mean margin or band coverage). You can still publish for testing, but consider re-running or adjusting parameters.")
-
-    # ----------------------------
-    # 4) Publish
-    # ----------------------------
-    st.subheader("4) Publish")
-    if st.button("Publish This Version"):
-        path = publish_version(version)
-        st.success(f"Published as {path}")
-
-st.markdown("---")
-st.subheader("5) Versions")
-vers = list_versions()
-if not vers:
-    st.caption("No versions yet.")
 else:
-    vv = pd.DataFrame(vers)
-    st.dataframe(vv, use_container_width=True)
+    st.info("Adjust parameters in the sidebar, then click **Run Calibration**.")
