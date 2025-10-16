@@ -27,15 +27,29 @@ class CalibParams:
 # ----------------------------
 # Loader (handles both paths and uploads)
 # ----------------------------
-def _pick_column(cols, guess, fallback_idx):
-    m = [c for c in cols if guess.lower() in str(c).lower()]
-    return m[0] if m else cols[fallback_idx]
+def _pick_column(cols: List[str], guess, fallback_idx: int):
+    """Pick a column matching 'guess' (case-insensitive substring), else fallback safely."""
+    try:
+        g = str(guess).lower()
+    except Exception:
+        g = ""
+    matches = [c for c in cols if g in str(c).lower()]
+    if matches:
+        return matches[0]
+    if not cols:
+        raise KeyError("No columns found in uploaded file.")
+    # clamp fallback index into range
+    return cols[min(max(fallback_idx, 0), len(cols) - 1)]
 
 def load_dataframe(source,
                    msrp_col: Optional[str] = None,
                    cost_col: Optional[str] = None,
                    state_col: Optional[str] = None) -> pd.DataFrame:
-    """Load CSV/XLSX from either a filesystem path or a file-like object."""
+    """
+    Load CSV/XLSX from either a filesystem path (str) OR a file-like object
+    (e.g., Streamlit's UploadedFile). Maps to MSRP, Cost_to_ULP, Destination_State.
+    """
+    # --- Read file into DataFrame ---
     if isinstance(source, str):
         name = source.lower()
         if name.endswith(".csv"):
@@ -43,6 +57,7 @@ def load_dataframe(source,
         else:
             src = pd.read_excel(source)
     else:
+        # Streamlit UploadedFile or BytesIO
         name = str(getattr(source, "name", "")).lower()
         try:
             if hasattr(source, "seek"):
@@ -56,6 +71,8 @@ def load_dataframe(source,
                 source.seek(0)
 
     cols = list(src.columns)
+
+    # Validate explicit selections if provided
     missing = []
     if msrp_col and msrp_col not in cols:   missing.append(f"MSRP='{msrp_col}'")
     if cost_col and cost_col not in cols:   missing.append(f"Cost to ULP='{cost_col}'")
@@ -63,9 +80,10 @@ def load_dataframe(source,
     if missing:
         raise KeyError(f"Missing columns: {', '.join(missing)}. Found: {cols}")
 
+    # Heuristic fallbacks if not provided
     msrp_use  = msrp_col  or _pick_column(cols, "msrp", 0)
-    cost_use  = cost_col  or _pick_column(cols, "cost to ulp", 1 if len(cols)>1 else 0)
-    state_use = state_col or _pick_column(cols, "destination state", 2 if len(cols)>2 else 0)
+    cost_use  = cost_col  or _pick_column(cols, "cost to ulp", 1 if len(cols) > 1 else 0)
+    state_use = state_col or _pick_column(cols, "destination state", 2 if len(cols) > 2 else 0)
 
     df = src.rename(columns={
         msrp_use: "MSRP",
@@ -73,10 +91,12 @@ def load_dataframe(source,
         state_use: "Destination_State"
     }).copy()
 
+    # Clean types
     df["MSRP"] = pd.to_numeric(df["MSRP"], errors="coerce")
     df["Cost_to_ULP"] = pd.to_numeric(df["Cost_to_ULP"], errors="coerce")
     df["Destination_State"] = df["Destination_State"].astype(str).str.strip().str.upper()
 
+    # Filters
     df = df.dropna(subset=["MSRP", "Cost_to_ULP", "Destination_State"])
     df = df[(df["MSRP"] > 0) & (df["Cost_to_ULP"] > 0)].copy()
     return df
@@ -159,7 +179,7 @@ def build_zones_and_tiers(df, params):
     for lab in tier_labels:
         g = dfz[dfz["Tier"] == lab]
         if g.empty:
-            mid, width = 0, 1
+            mid, width = 0.0, 1.0
         else:
             w = g["Cost_to_ULP"].values
             v = g["MSRP"].values
@@ -167,7 +187,7 @@ def build_zones_and_tiers(df, params):
             p10 = _weighted_quantile(v, w, 0.1)
             p90 = _weighted_quantile(v, w, 0.9)
             width = max(1.0, p90 - p10)
-        rows.append({"tier": lab, "mid": mid, "width": width})
+        rows.append({"tier": lab, "mid": float(mid), "width": float(width)})
     tnorm = pd.DataFrame(rows)
     mid_map = dict(zip(tnorm["tier"], tnorm["mid"]))
     wid_map = dict(zip(tnorm["tier"], tnorm["width"]))
@@ -204,23 +224,27 @@ def calibrate(dfz, params, prev_multipliers=None):
             k = (z,t)
             a,b = mults[k]
             totw = float(g["w"].sum())
-            if totw <= 0: continue
+            if totw <= 0: 
+                mults[k] = (a,b)
+                continue
             below_w = float(g.loc[g["marg"] < params.band_low, "w"].sum())
             above_w = float(g.loc[g["marg"] > params.band_high, "w"].sum())
             inside_w = totw - below_w - above_w
             inside_r = inside_w / totw
             if inside_r < params.band_target:
+                # shift center against heavier tail
                 skew = (below_w - above_w) / totw
                 a *= (1.0 + params.lr_tail * skew)
+                # tilt with slope via correlation to "outside" direction
                 outsig = np.zeros(len(g))
-                outsig[g["marg"] < params.band_low] = +1
-                outsig[g["marg"] > params.band_high] = -1
+                outsig[g["marg"] < params.band_low] = +1.0
+                outsig[g["marg"] > params.band_high] = -1.0
                 x = g["x"].values
                 wgt = g["w"].values
                 wx = np.average(x, weights=wgt)
                 wo = np.average(outsig, weights=wgt)
-                cov = np.average((x - wx)*(outsig - wo), weights=wgt)
-                b += params.lr_tail * 0.5 * cov
+                cov = np.average((x - wx) * (outsig - wo), weights=wgt)
+                b += params.lr_tail * 0.5 * float(cov)
                 b = max(-0.5, min(0.5, b))
             mults[k] = (a,b)
 
@@ -272,25 +296,30 @@ def build_version(df, params, prev=None):
         prev_mults = {}
         for r in prev["zt_multipliers"]:
             if "a" in r and "b" in r:
-                prev_mults[(r["zone"],r["tier"])] = (r["a"], r["b"])
+                prev_mults[(r["zone"],r["tier"])] = (float(r["a"]), float(r["b"]))
             else:
-                prev_mults[(r["zone"],r["tier"])] = (r["multiplier"], 0.0)
+                prev_mults[(r["zone"],r["tier"])] = (float(r["multiplier"]), 0.0)
     mults = calibrate(dfz, params, prev_mults)
     mults = normalize_total(dfz, mults, params)
     metrics = score(dfz, mults, params)
+
     zone_table = dfz.groupby("Zone").apply(
-        lambda g: pd.Series({"Zone_Expected_Cost_Ratio": np.average(g["Adj_Zone_Ratio"], weights=g["Cost_to_ULP"])})
+        lambda g: pd.Series({"Zone_Expected_Cost_Ratio": float(np.average(g["Adj_Zone_Ratio"], weights=g["Cost_to_ULP"]))})
     ).reset_index()
+
     state_map = state_stats[["Destination_State","Zone"]].copy()
+
     zt_rows = [{"zone":z,"tier":t,"a":float(a),"b":float(b)} for (z,t),(a,b) in mults.items()]
+
     version = {
         "params": vars(params),
         "metrics": metrics,
         "zones": [{"zone":r["Zone"],"expected_cost_ratio":r["Zone_Expected_Cost_Ratio"]} for _,r in zone_table.iterrows()],
         "state_map":[{"state":r["Destination_State"],"zone":r["Zone"]} for _,r in state_map.iterrows()],
-        "tiers":{"breaks":list(params.msrp_breaks),"labels":list(tnorm["tier"])},
+        "tiers":{"breaks":list(params.msrp_breaks),
+                 "labels":[str(x) for x in tnorm["tier"].tolist()]},
         "zt_multipliers":zt_rows,
-        "tier_norm":[{"tier":r["tier"],"mid":r["mid"],"width":r["width"]} for _,r in tnorm.iterrows()]
+        "tier_norm":[{"tier":r["tier"],"mid":float(r["mid"]),"width":float(r["width"])} for _,r in tnorm.iterrows()]
     }
     return version, state_map, zone_table
 
@@ -307,7 +336,7 @@ def _mult_lookup_ab(version, zone, tier):
     if "_mult_index_ab" not in version:
         version["_mult_index_ab"] = {(r["zone"],r["tier"]):(r.get("a",r.get("multiplier",1.0)), r.get("b",0.0))
                                      for r in version.get("zt_multipliers",[])}
-    return version["_mult_index_ab"].get((zone,tier),(1.18,0.0))
+    return version["_mult_index_ab"].get((zone,tier),(1.0 + version["params"].get("target_mean", 0.18), 0.0))
 
 def _tier_norm_lookup(version,tier):
     if "_tier_norm_index" not in version:
