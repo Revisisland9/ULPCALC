@@ -12,68 +12,58 @@ ZONES_DEFAULT = ["Low", "Medium-Low", "Medium-High", "High"]
 # ----------------------------
 @dataclass
 class CalibParams:
-    # Global profitability target (mean margin on cost basis)
     target_mean: float = 0.18
-
-    # Margin band we want most shipments to fall into
     band_low: float = 0.10
     band_high: float = 0.40
-    band_target: float = 0.95  # cost-weighted coverage target
-
-    # Zoning
-    zones: int = 4  # number of state cost-behavior zones (quartiles by default)
-
-    # MSRP tiering (piecewise)
-    # Breaks define bins: [0, 500, 1000, 2000, +inf] → 4 tiers by default
+    band_target: float = 0.80
+    zones: int = 4
     msrp_breaks: Tuple[float, ...] = (0.0, 500.0, 1000.0, 2000.0, float("inf"))
-
-    # Stabilization (shrink zone ratio toward global ratio)
-    shrinkage: float = 0.80  # 0.0 = global only, 1.0 = zone only
-
-    # Optimizer
+    shrinkage: float = 0.80
     iters: int = 120
-    lr_mean: float = 0.25   # global centering step
-    lr_tail: float = 0.10   # per (zone×tier) tightening step
-
-    # State micro-adjustments (to tighten band coverage without overfitting)
-    use_state_adjust: bool = True
-    lr_state: float = 0.15          # learning rate for state nudges
-    state_cap_pct: float = 0.10     # per-state cap ±10% around 1.0
-
-    # Stability vs previous version
-    change_cap_pct: float = 0.07  # cap ± vs previous multipliers on publish
+    lr_mean: float = 0.30
+    lr_tail: float = 0.15
+    change_cap_pct: float = 0.07
 
 # ----------------------------
-# Loader
+# Loader (handles both paths and uploads)
 # ----------------------------
 def _pick_column(cols, guess, fallback_idx):
     m = [c for c in cols if guess.lower() in str(c).lower()]
     return m[0] if m else cols[fallback_idx]
 
-def load_dataframe(path: str,
+def load_dataframe(source,
                    msrp_col: Optional[str] = None,
                    cost_col: Optional[str] = None,
                    state_col: Optional[str] = None) -> pd.DataFrame:
-    """Load CSV/XLSX and map columns to MSRP, Cost_to_ULP, Destination_State explicitly.
-       Raises a clear error if a selected column is missing.
-    """
-    if path.lower().endswith(".csv"):
-        src = pd.read_csv(path)
+    """Load CSV/XLSX from either a filesystem path or a file-like object."""
+    if isinstance(source, str):
+        name = source.lower()
+        if name.endswith(".csv"):
+            src = pd.read_csv(source)
+        else:
+            src = pd.read_excel(source)
     else:
-        src = pd.read_excel(path)
+        name = str(getattr(source, "name", "")).lower()
+        try:
+            if hasattr(source, "seek"):
+                source.seek(0)
+            if name.endswith(".csv"):
+                src = pd.read_csv(source)
+            else:
+                src = pd.read_excel(source)
+        finally:
+            if hasattr(source, "seek"):
+                source.seek(0)
 
     cols = list(src.columns)
-
-    # Validate explicit selections if provided
     missing = []
     if msrp_col and msrp_col not in cols:   missing.append(f"MSRP='{msrp_col}'")
     if cost_col and cost_col not in cols:   missing.append(f"Cost to ULP='{cost_col}'")
     if state_col and state_col not in cols: missing.append(f"Destination State='{state_col}'")
     if missing:
-        raise KeyError(f"Selected column(s) not found in file: {', '.join(missing)}. Available: {cols}")
+        raise KeyError(f"Missing columns: {', '.join(missing)}. Found: {cols}")
 
-    # Fallback heuristics if not provided
-    msrp_use  = msrp_col  or _pick_column(cols, "msrp", 0 if len(cols)>0 else 0)
+    msrp_use  = msrp_col  or _pick_column(cols, "msrp", 0)
     cost_use  = cost_col  or _pick_column(cols, "cost to ulp", 1 if len(cols)>1 else 0)
     state_use = state_col or _pick_column(cols, "destination state", 2 if len(cols)>2 else 0)
 
@@ -83,12 +73,10 @@ def load_dataframe(path: str,
         state_use: "Destination_State"
     }).copy()
 
-    # Clean
     df["MSRP"] = pd.to_numeric(df["MSRP"], errors="coerce")
     df["Cost_to_ULP"] = pd.to_numeric(df["Cost_to_ULP"], errors="coerce")
     df["Destination_State"] = df["Destination_State"].astype(str).str.strip().str.upper()
 
-    # Filters
     df = df.dropna(subset=["MSRP", "Cost_to_ULP", "Destination_State"])
     df = df[(df["MSRP"] > 0) & (df["Cost_to_ULP"] > 0)].copy()
     return df
@@ -96,9 +84,7 @@ def load_dataframe(path: str,
 # ----------------------------
 # Zoning & Tiering
 # ----------------------------
-def _assign_zones(df: pd.DataFrame, zones: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Build state medians of cost/MSRP, assign states to zones by quantiles,
-       and compute zone expected cost ratios (count-weighted across states)."""
+def _assign_zones(df: pd.DataFrame, zones: int):
     state_stats = (
         df.assign(cost_ratio=df["Cost_to_ULP"]/df["MSRP"])
           .groupby("Destination_State")
@@ -106,18 +92,13 @@ def _assign_zones(df: pd.DataFrame, zones: int) -> Tuple[pd.DataFrame, pd.DataFr
                Median_Cost_Ratio=("cost_ratio","median"))
           .reset_index()
     )
-
     qcuts = np.linspace(0, 100, zones + 1)[1:-1]
     edges = np.percentile(state_stats["Median_Cost_Ratio"], qcuts) if len(state_stats) else []
     labels = ZONES_DEFAULT[:zones]
-
     def to_zone(v):
         idx = np.searchsorted(edges, v, side="right")
         return labels[idx]
-
     state_stats["Zone"] = state_stats["Median_Cost_Ratio"].apply(to_zone)
-
-    # Count-weighted mean of state medians per zone
     zone_ratio = (
         state_stats.groupby("Zone")
         .apply(lambda g: np.average(g["Median_Cost_Ratio"], weights=g["Count"]))
@@ -126,210 +107,152 @@ def _assign_zones(df: pd.DataFrame, zones: int) -> Tuple[pd.DataFrame, pd.DataFr
     )
     return state_stats, zone_ratio
 
-def _assign_tiers(msrp: pd.Series, breaks: Tuple[float, ...]) -> pd.Series:
+def _assign_tiers(msrp: pd.Series, breaks: Tuple[float, ...]):
     bins = list(breaks)
     labels = []
     for i in range(len(bins)-1):
         lo, hi = bins[i], bins[i+1]
         labels.append(f"{int(lo)}–{('∞' if hi==float('inf') else int(hi))}")
     idx = pd.cut(msrp, bins=bins, right=False, labels=labels, include_lowest=True)
-    return idx.astype(str)
+    return idx.astype(str), labels, bins
 
 # ----------------------------
-# Core evaluation helpers
+# Helpers
 # ----------------------------
-def _evaluate(dfz: pd.DataFrame,
-              zt_mults: Dict[Tuple[str, str], float],
-              state_adj: Dict[str, float],
-              ratio_col: str) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """Compute price and realized margin using:
-       price = MSRP × ratio × ZT_multiplier × State_Adjustment
-    """
+def _weighted_quantile(values, weights, q):
+    if len(values) == 0:
+        return float("nan")
+    order = np.argsort(values)
+    v = values[order]
+    w = weights[order]
+    cumw = np.cumsum(w)
+    if cumw[-1] <= 0:
+        return float("nan")
+    return float(np.interp(q * cumw[-1], cumw, v))
+
+# ----------------------------
+# Core evaluation
+# ----------------------------
+def _evaluate(dfz, mults_ab, ratio_col):
     key = list(zip(dfz["Zone"], dfz["Tier"]))
-    m_zt = np.array([zt_mults.get(k, 1.0) for k in key], dtype=float)
-    m_state = np.array([state_adj.get(s, 1.0) for s in dfz["Destination_State"]], dtype=float)
-
-    ratio = dfz[ratio_col].values
-    msrp = dfz["MSRP"].values
-    cost = dfz["Cost_to_ULP"].values
-
-    price = msrp * ratio * m_zt * m_state
-    margin = (price - cost) / cost
-    return pd.Series(price, index=dfz.index), pd.Series(margin, index=dfz.index), pd.Series(m_zt * m_state, index=dfz.index)
+    a = np.array([mults_ab.get(k, (1.0, 0.0))[0] for k in key], float)
+    b = np.array([mults_ab.get(k, (1.0, 0.0))[1] for k in key], float)
+    m = np.clip(a + b * dfz["MSRP_Norm"].values, 0.2, 5.0)
+    price = dfz["MSRP"].values * dfz[ratio_col].values * m
+    margin = (price - dfz["Cost_to_ULP"].values) / dfz["Cost_to_ULP"].values
+    return pd.Series(price, index=dfz.index), pd.Series(margin, index=dfz.index)
 
 # ----------------------------
-# Calibration
+# Build zones, tiers, and normalization
 # ----------------------------
-def build_zones_and_tiers(df: pd.DataFrame, params: CalibParams) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, float]:
-    """Attach zone and tier to each row; compute zone expected ratios (with shrinkage)."""
+def build_zones_and_tiers(df, params):
     state_stats, zone_ratio = _assign_zones(df, params.zones)
-
-    # Global ratio for shrinkage baseline
     global_ratio = df["Cost_to_ULP"].sum() / df["MSRP"].sum()
-
-    # Attach zone to rows
     dfz = df.merge(state_stats[["Destination_State", "Zone"]], on="Destination_State", how="left")
     dfz = dfz.merge(zone_ratio, on="Zone", how="left")
-
-    # Apply shrinkage toward global ratio (stabilizes extremes)
     dfz["Adj_Zone_Ratio"] = params.shrinkage * dfz["Zone_Expected_Cost_Ratio"] + (1 - params.shrinkage) * global_ratio
 
-    # Assign MSRP tier labels
-    dfz["Tier"] = _assign_tiers(dfz["MSRP"], params.msrp_breaks)
+    tier_series, tier_labels, breaks = _assign_tiers(dfz["MSRP"], params.msrp_breaks)
+    dfz["Tier"] = tier_series
 
-    return state_stats, zone_ratio, dfz, global_ratio
+    rows = []
+    for lab in tier_labels:
+        g = dfz[dfz["Tier"] == lab]
+        if g.empty:
+            mid, width = 0, 1
+        else:
+            w = g["Cost_to_ULP"].values
+            v = g["MSRP"].values
+            mid = _weighted_quantile(v, w, 0.5)
+            p10 = _weighted_quantile(v, w, 0.1)
+            p90 = _weighted_quantile(v, w, 0.9)
+            width = max(1.0, p90 - p10)
+        rows.append({"tier": lab, "mid": mid, "width": width})
+    tnorm = pd.DataFrame(rows)
+    mid_map = dict(zip(tnorm["tier"], tnorm["mid"]))
+    wid_map = dict(zip(tnorm["tier"], tnorm["width"]))
+    dfz["Tier_Mid"] = dfz["Tier"].map(mid_map)
+    dfz["Tier_Width"] = dfz["Tier"].map(wid_map)
+    dfz["MSRP_Norm"] = (dfz["MSRP"] - dfz["Tier_Mid"]) / dfz["Tier_Width"]
+    return state_stats, zone_ratio, dfz, global_ratio, tnorm
 
-def calibrate(dfz: pd.DataFrame,
-              params: CalibParams,
-              prev_zt: Optional[Dict[Tuple[str,str], float]] = None,
-              prev_state_adj: Optional[Dict[str, float]] = None) -> Tuple[Dict[Tuple[str,str], float], Dict[str, float]]:
-    """Learn multipliers per (Zone × Tier) and small per-state adjustments."""
-    # Start near target for all zone×tier keys observed
+# ----------------------------
+# Calibration (a,b)
+# ----------------------------
+def calibrate(dfz, params, prev_multipliers=None):
     keys = sorted(set(zip(dfz["Zone"], dfz["Tier"])))
-    zt_mults = {k: 1.0 + params.target_mean for k in keys}
-
-    # State micro-adjustments
-    states = dfz["Destination_State"].unique().tolist()
-    state_adj = {s: 1.0 for s in states}
-
-    # cost-weight vector
-    w = dfz["Cost_to_ULP"].values
-    w = np.where(w > 0, w, 1.0)
-
-    ratio_col = "Adj_Zone_Ratio"  # stabilized ratio for optimization
+    mults = {k: (1.0 + params.target_mean, 0.0) for k in keys}
+    w = np.where(dfz["Cost_to_ULP"] > 0, dfz["Cost_to_ULP"], 1.0)
+    ratio_col = "Adj_Zone_Ratio"
 
     for _ in range(params.iters):
-        price, marg, comb_mult = _evaluate(dfz, zt_mults, state_adj, ratio_col=ratio_col)
-
-        # 1) Global centering towards target revenue (Σprice = Σcost × (1+target))
+        price, marg = _evaluate(dfz, mults, ratio_col)
         target_rev = dfz["Cost_to_ULP"].sum() * (1 + params.target_mean)
         cur_rev = float(price.sum())
         if cur_rev != 0:
             scale = target_rev / cur_rev
             step = 1.0 + params.lr_mean * (scale - 1.0)
-            for k in zt_mults:
-                zt_mults[k] *= step
-            for s in state_adj:
-                state_adj[s] *= step  # keep relative mix but allow global movement
+            for k in mults:
+                a, b = mults[k]
+                mults[k] = (a * step, b * step)
 
-        # 2) Per (Zone×Tier) tightening for cost-weighted band coverage
         ztdf = pd.DataFrame({
-            "Zone": dfz["Zone"].values,
-            "Tier": dfz["Tier"].values,
-            "marg": marg.values,
-            "w": w
+            "Zone": dfz["Zone"], "Tier": dfz["Tier"],
+            "marg": marg, "w": w, "x": dfz["MSRP_Norm"]
         })
-        grp = ztdf.groupby(["Zone","Tier"])
-        tot_w = grp["w"].sum()
-        below_w = grp.apply(lambda g: g.loc[g["marg"] < params.band_low, "w"].sum())
-        above_w = grp.apply(lambda g: g.loc[g["marg"] > params.band_high, "w"].sum())
-        inside_w = tot_w - below_w - above_w
-        below_r = (below_w / tot_w).fillna(0.0)
-        above_r = (above_w / tot_w).fillna(0.0)
-        inside_r = (inside_w / tot_w).fillna(0.0)
+        for (z,t), g in ztdf.groupby(["Zone","Tier"]):
+            k = (z,t)
+            a,b = mults[k]
+            totw = float(g["w"].sum())
+            if totw <= 0: continue
+            below_w = float(g.loc[g["marg"] < params.band_low, "w"].sum())
+            above_w = float(g.loc[g["marg"] > params.band_high, "w"].sum())
+            inside_w = totw - below_w - above_w
+            inside_r = inside_w / totw
+            if inside_r < params.band_target:
+                skew = (below_w - above_w) / totw
+                a *= (1.0 + params.lr_tail * skew)
+                outsig = np.zeros(len(g))
+                outsig[g["marg"] < params.band_low] = +1
+                outsig[g["marg"] > params.band_high] = -1
+                x = g["x"].values
+                wgt = g["w"].values
+                wx = np.average(x, weights=wgt)
+                wo = np.average(outsig, weights=wgt)
+                cov = np.average((x - wx)*(outsig - wo), weights=wgt)
+                b += params.lr_tail * 0.5 * cov
+                b = max(-0.5, min(0.5, b))
+            mults[k] = (a,b)
 
-        for (z,t), _tot in tot_w.items():
-            if _tot <= 0:
-                continue
-            key = (z,t)
-            if inside_r.loc[(z,t)] < params.band_target:
-                if below_r.loc[(z,t)] > 0.04:
-                    zt_mults[key] *= (1 + params.lr_tail * min(0.10, float(below_r.loc[(z,t)])))
-                if above_r.loc[(z,t)] > 0.04:
-                    zt_mults[key] *= (1 - params.lr_tail * min(0.10, float(above_r.loc[(z,t)])))
-
-        # 3) State micro-adjustments (cost-weighted) — capped to ±state_cap_pct
-        if params.use_state_adjust:
-            sdf = pd.DataFrame({
-                "state": dfz["Destination_State"].values,
-                "marg": marg.values,
-                "w": w
-            })
-            sgrp = sdf.groupby("state")
-            sw = sgrp["w"].sum()
-            below_sw = sgrp.apply(lambda g: g.loc[g["marg"] < params.band_low, "w"].sum())
-            above_sw = sgrp.apply(lambda g: g.loc[g["marg"] > params.band_high, "w"].sum())
-            inside_sw = sw - below_sw - above_sw
-            below_sr = (below_sw / sw).fillna(0.0)
-            above_sr = (above_sw / sw).fillna(0.0)
-            inside_sr = (inside_sw / sw).fillna(0.0)
-
-            for s in states:
-                if sw.get(s, 0.0) <= 0:
-                    continue
-                if inside_sr.get(s, 0.0) < params.band_target:
-                    adj = 1.0
-                    if below_sr.get(s, 0.0) > 0.05:  # too many <10%
-                        adj *= (1 + params.lr_state * min(0.10, float(below_sr.get(s, 0.0))))
-                    if above_sr.get(s, 0.0) > 0.05:  # too many >40%
-                        adj *= (1 - params.lr_state * min(0.10, float(above_sr.get(s, 0.0))))
-                    # Apply and cap around 1.0
-                    state_adj[s] *= adj
-                    hi = 1.0 + params.state_cap_pct
-                    lo = 1.0 - params.state_cap_pct
-                    state_adj[s] = max(lo, min(hi, state_adj[s]))
-
-    # Optional cap vs previous version (stability)
-    if prev_zt:
+    if prev_multipliers:
         capped = {}
-        for k, m in zt_mults.items():
-            prev = prev_zt.get(k, m)
-            hi = prev * (1 + params.change_cap_pct)
-            lo = prev * (1 - params.change_cap_pct)
-            capped[k] = max(lo, min(hi, m))
-        zt_mults = capped
+        for k, (a,b) in mults.items():
+            prev_a, prev_b = prev_multipliers.get(k, (a,b))
+            hi_a, lo_a = prev_a*(1+params.change_cap_pct), prev_a*(1-params.change_cap_pct)
+            hi_b, lo_b = prev_b*(1+params.change_cap_pct), prev_b*(1-params.change_cap_pct)
+            capped[k] = (max(lo_a,min(hi_a,a)), max(lo_b,min(hi_b,b)))
+        mults = capped
+    return mults
 
-    if prev_state_adj:
-        capped_s = {}
-        for s, m in state_adj.items():
-            prev = prev_state_adj.get(s, m)
-            hi = prev * (1 + params.change_cap_pct)
-            lo = prev * (1 - params.change_cap_pct)
-            capped_s[s] = max(lo, min(hi, m))
-        state_adj = capped_s
-
-    return zt_mults, state_adj
-
-def normalize_total(dfz: pd.DataFrame,
-                    zt_mults: Dict[Tuple[str,str], float],
-                    state_adj: Dict[str, float],
-                    params: CalibParams) -> Tuple[Dict[Tuple[str,str], float], Dict[str, float]]:
-    """Final normalization: ensure Σprice == Σcost × (1+target), with stabilized ratios."""
-    price, _, _ = _evaluate(dfz, zt_mults, state_adj, ratio_col="Adj_Zone_Ratio")
-    target_rev = dfz["Cost_to_ULP"].sum() * (1 + params.target_mean)
+def normalize_total(dfz, mults, params):
+    price,_ = _evaluate(dfz, mults, "Adj_Zone_Ratio")
+    target_rev = dfz["Cost_to_ULP"].sum() * (1+params.target_mean)
     scale = float(target_rev / price.sum()) if price.sum() else 1.0
-    zt_mults = {k: m * scale for k, m in zt_mults.items()}
-    state_adj = {s: m * scale for s, m in state_adj.items()}
-    return zt_mults, state_adj
+    return {k: (a*scale, b*scale) for k,(a,b) in mults.items()}
 
 # ----------------------------
 # Scoring
 # ----------------------------
-def score(dfz: pd.DataFrame,
-          zt_mults: Dict[Tuple[str,str], float],
-          state_adj: Dict[str, float],
-          params: CalibParams) -> dict:
-    """Return cost-weighted KPIs (primary) and unweighted for reference."""
-    price, marg, _ = _evaluate(dfz, zt_mults, state_adj, ratio_col="Adj_Zone_Ratio")
-
-    # primary (cost-weighted)
+def score(dfz, mults, params):
+    price, marg = _evaluate(dfz, mults, "Adj_Zone_Ratio")
     total_cost = float(dfz["Cost_to_ULP"].sum())
-    total_rev  = float(price.sum())
+    total_rev = float(price.sum())
     mean_w = (total_rev / total_cost - 1.0) if total_cost > 0 else float("nan")
-    w = dfz["Cost_to_ULP"].values
-    w = np.where(w > 0, w, 1.0)
-    wsum = w.sum() if w.sum() != 0 else 1.0
-
-    inside_w = float(w[((marg>=params.band_low)&(marg<=params.band_high))].sum() / wsum)
-    below_w  = float(w[(marg < params.band_low)].sum() / wsum)
-    above_w  = float(w[(marg > params.band_high)].sum() / wsum)
-
-    # reference (unweighted)
-    mean_unw = float(marg.mean())
-    inside_unw = float(((marg>=params.band_low)&(marg<=params.band_high)).mean())
-    below_unw  = float((marg<params.band_low).mean())
-    above_unw  = float((marg>params.band_high).mean())
-
+    w = np.where(dfz["Cost_to_ULP"] > 0, dfz["Cost_to_ULP"], 1.0)
+    wsum = w.sum() or 1.0
+    inside_w = float(w[(marg.between(params.band_low, params.band_high))].sum()/wsum)
+    below_w = float(w[marg < params.band_low].sum()/wsum)
+    above_w = float(w[marg > params.band_high].sum()/wsum)
     return {
         "total_cost": total_cost,
         "total_revenue": total_rev,
@@ -337,142 +260,75 @@ def score(dfz: pd.DataFrame,
         "pct_inside": inside_w,
         "pct_below": below_w,
         "pct_above": above_w,
-        "mean_margin_unweighted": mean_unw,
-        "pct_inside_unweighted": inside_unw,
-        "pct_below_unweighted": below_unw,
-        "pct_above_unweighted": above_unw
     }
 
 # ----------------------------
-# Build version payload (export)
+# Build version payload
 # ----------------------------
-def build_zones_and_prepare(df: pd.DataFrame, params: CalibParams):
-    state_stats, zone_ratio, dfz, global_ratio = build_zones_and_tiers(df, params)
-    return state_stats, zone_ratio, dfz, global_ratio
-
-def build_version(df: pd.DataFrame,
-                  params: CalibParams,
-                  prev: Optional[dict] = None) -> Tuple[dict, pd.DataFrame, pd.DataFrame]:
-    """Full pipeline: zone & tier assignment, calibration, normalization, scoring, export tables."""
-    state_stats, zone_ratio, dfz, global_ratio = build_zones_and_tiers(df, params)
-
-    # Previous multipliers (for change cap), if available
-    prev_zt = None
-    prev_state_adj = None
-    if prev:
-        if "zt_multipliers" in prev:
-            prev_zt = { (r["zone"], r["tier"]): r["multiplier"] for r in prev["zt_multipliers"] }
-        if "state_adjustments" in prev:
-            prev_state_adj = { r["state"]: r["adj"] for r in prev["state_adjustments"] }
-
-    zt_mults, state_adj = calibrate(dfz, params, prev_zt, prev_state_adj)
-    zt_mults, state_adj = normalize_total(dfz, zt_mults, state_adj, params)
-    metrics = score(dfz, zt_mults, state_adj, params)
-
-    # Build exportables
-
-    # Stabilized per-zone ratio (cost-weighted avg of Adj_Zone_Ratio inside each zone)
-    zdf = dfz.groupby("Zone").apply(
-        lambda g: pd.Series({
-            "Zone_Expected_Cost_Ratio": float(np.average(g["Adj_Zone_Ratio"], weights=g["Cost_to_ULP"]))
-        })
+def build_version(df, params, prev=None):
+    state_stats, zone_ratio, dfz, global_ratio, tnorm = build_zones_and_tiers(df, params)
+    prev_mults = None
+    if prev and "zt_multipliers" in prev:
+        prev_mults = {}
+        for r in prev["zt_multipliers"]:
+            if "a" in r and "b" in r:
+                prev_mults[(r["zone"],r["tier"])] = (r["a"], r["b"])
+            else:
+                prev_mults[(r["zone"],r["tier"])] = (r["multiplier"], 0.0)
+    mults = calibrate(dfz, params, prev_mults)
+    mults = normalize_total(dfz, mults, params)
+    metrics = score(dfz, mults, params)
+    zone_table = dfz.groupby("Zone").apply(
+        lambda g: pd.Series({"Zone_Expected_Cost_Ratio": np.average(g["Adj_Zone_Ratio"], weights=g["Cost_to_ULP"])})
     ).reset_index()
-    zone_table = zdf.copy()
-    zone_table["Zone"] = zone_table["Zone"].astype(str)
-
-    # State map (state → zone)
     state_map = state_stats[["Destination_State","Zone"]].copy()
-
-    # MSRP tier definitions (edges/labels)
-    breaks = list(params.msrp_breaks)
-    tier_labels = []
-    for i in range(len(breaks)-1):
-        lo, hi = breaks[i], breaks[i+1]
-        tier_labels.append(f"{int(lo)}–{('∞' if hi==float('inf') else int(hi))}")
-
-    # Zone×Tier multipliers
-    zt_rows = []
-    for (z, t), m in sorted(zt_mults.items()):
-        zt_rows.append({
-            "zone": str(z),
-            "tier": str(t),
-            "multiplier": float(m)
-        })
-
-    # State adjustments
-    sa_rows = [{"state": s, "adj": float(a)} for s, a in sorted(state_adj.items())]
-
-    # Final version payload
+    zt_rows = [{"zone":z,"tier":t,"a":float(a),"b":float(b)} for (z,t),(a,b) in mults.items()]
     version = {
-        "params": {
-            **vars(params),
-            "msrp_breaks": list(params.msrp_breaks)
-        },
+        "params": vars(params),
         "metrics": metrics,
-        # Stabilized ratios per zone (used everywhere)
-        "zones": [
-            {"zone": r["Zone"], "expected_cost_ratio": float(r["Zone_Expected_Cost_Ratio"])}
-            for _, r in zone_table.iterrows()
-        ],
-        # State → zone lookup
-        "state_map": [
-            {"state": r["Destination_State"], "zone": r["Zone"]}
-            for _, r in state_map.iterrows()
-        ],
-        # MSRP tiers
-        "tiers": {
-            "breaks": breaks,
-            "labels": tier_labels
-        },
-        # Multipliers per (zone × tier)
-        "zt_multipliers": zt_rows,
-        # Bounded per-state adjustments
-        "state_adjustments": sa_rows
+        "zones": [{"zone":r["Zone"],"expected_cost_ratio":r["Zone_Expected_Cost_Ratio"]} for _,r in zone_table.iterrows()],
+        "state_map":[{"state":r["Destination_State"],"zone":r["Zone"]} for _,r in state_map.iterrows()],
+        "tiers":{"breaks":list(params.msrp_breaks),"labels":list(tnorm["tier"])},
+        "zt_multipliers":zt_rows,
+        "tier_norm":[{"tier":r["tier"],"mid":r["mid"],"width":r["width"]} for _,r in tnorm.iterrows()]
     }
-
     return version, state_map, zone_table
 
 # ----------------------------
-# Runtime helpers (for Quote/Bulk)
+# Runtime helpers
 # ----------------------------
-def _tier_for_value(v: float, breaks: List[float], labels: List[str]) -> str:
+def _tier_for_value(v, breaks, labels):
     for i in range(len(breaks)-1):
         if breaks[i] <= v < breaks[i+1]:
             return labels[i]
     return labels[-1]
 
-def _build_indexes(version: dict):
-    # cache: state->zone, zone->ratio, (zone,tier)->mult, state->adj
-    if "_state_index" not in version:
-        version["_state_index"] = { r["state"]: r["zone"] for r in version.get("state_map", []) }
-    if "_zone_ratio" not in version:
-        version["_zone_ratio"] = { r["zone"]: r["expected_cost_ratio"] for r in version.get("zones", []) }
-    if "_zt_mult" not in version:
-        version["_zt_mult"] = { (r["zone"], r["tier"]): r["multiplier"] for r in version.get("zt_multipliers", []) }
-    if "_state_adj" not in version:
-        version["_state_adj"] = { r["state"]: r["adj"] for r in version.get("state_adjustments", []) }
+def _mult_lookup_ab(version, zone, tier):
+    if "_mult_index_ab" not in version:
+        version["_mult_index_ab"] = {(r["zone"],r["tier"]):(r.get("a",r.get("multiplier",1.0)), r.get("b",0.0))
+                                     for r in version.get("zt_multipliers",[])}
+    return version["_mult_index_ab"].get((zone,tier),(1.18,0.0))
 
-def price_for(msrp: float, state: str, version: dict) -> float:
-    """Compute price for a single (MSRP, state) using the tiered + state-adjusted model."""
-    _build_indexes(version)
-    state = str(state).strip().upper()
+def _tier_norm_lookup(version,tier):
+    if "_tier_norm_index" not in version:
+        version["_tier_norm_index"] = {r["tier"]:(r["mid"],r["width"]) for r in version.get("tier_norm",[])}
+    return version["_tier_norm_index"].get(tier,(0.0,1.0))
 
-    zone = version["_state_index"].get(state)
-    if zone is None:
-        # fallback: use first zone if unseen
-        zone = next(iter(version["_zone_ratio"].keys()))
+def price_for(msrp,state,version):
+    state=str(state).strip().upper()
+    smap=version.get("_state_index")
+    if smap is None:
+        smap={r["state"]:r["zone"] for r in version.get("state_map",[])}
+        version["_state_index"]=smap
+    zone=smap.get(state,version["zones"][0]["zone"])
+    zrat={r["zone"]:r["expected_cost_ratio"] for r in version.get("zones",[])}.get(zone,1.0)
+    breaks=version["tiers"]["breaks"]; labels=version["tiers"]["labels"]
+    tier=_tier_for_value(float(msrp),breaks,labels)
+    mid,width=_tier_norm_lookup(version,tier)
+    x=(float(msrp)-float(mid))/max(1.0,float(width))
+    a,b=_mult_lookup_ab(version,zone,tier)
+    m=max(0.2,min(5.0,a+b*x))
+    return float(msrp)*float(zrat)*float(m)
 
-    zrat = version["_zone_ratio"].get(zone, 1.0)
-    breaks = version["tiers"]["breaks"]
-    labels = version["tiers"]["labels"]
-    tier = _tier_for_value(float(msrp), breaks, labels)
-    mult = version["_zt_mult"].get((zone, tier), 1.0 + version["params"].get("target_mean", 0.18))
-    adj  = version["_state_adj"].get(state, 1.0)
-    return float(msrp) * float(zrat) * float(mult) * float(adj)
-
-def price_for_many(msrps: List[float], states: List[str], version: dict) -> List[float]:
-    _build_indexes(version)
-    out = []
-    for msrp, state in zip(msrps, states):
-        out.append(price_for(msrp, state, version))
-    return out
+def price_for_many(msrps,states,version):
+    return [price_for(m,s,version) for m,s in zip(msrps,states)]
