@@ -17,27 +17,32 @@ class CalibParams:
     target_mean: float = 0.18
     band_low: float = 0.10
     band_high: float = 0.40
-    band_target: float = 0.85  # optimization tries to reach this coverage
+    band_target: float = 0.85  # optimization target for % inside band
+
     # Zoning / tiering
     zones: int = 4
     msrp_breaks: Optional[Tuple[float, ...]] = None  # None → use quantile tiers
-    tiers: int = 16                                  # number of quantile tiers if msrp_breaks is None
+    tiers: int = 16                                  # if msrp_breaks is None
     shrinkage: float = 0.70                          # zone ratio shrink toward global
+
     # Optimizer
     iters: int = 140
     lr_mean: float = 0.30
     lr_tail: float = 0.22
     change_cap_pct: float = 0.07
-    # Slope clamp for b
-    b_cap: float = 1.0
+    b_cap: float = 1.0                               # clamp for slope b
+
     # Per-state correction
     with_c_state: bool = True
-    c_state_step_scale: float = 0.03   # tiny step
-    c_state_decay: float = 0.90        # shrink toward 0 each iter
-    c_state_cap: float = 0.12          # clamp magnitude of c_state
-    # Optional runtime guard (applied in price_for)
-    guard_low: Optional[float] = None  # e.g., 0.10
-    guard_high: Optional[float] = None # e.g., 0.40
+    c_state_step_scale: float = 0.03
+    c_state_decay: float = 0.90
+    c_state_cap: float = 0.12
+
+    # Optional guard to enforce band during pricing
+    # When cost is UNKNOWN at quote time → we clamp the MULTIPLIER m
+    # When cost is KNOWN → we clamp PRICE vs cost exactly
+    guard_low: Optional[float] = None   # e.g., 0.10
+    guard_high: Optional[float] = None  # e.g., 0.40
 
 # ============================
 # Loader (paths & file-like)
@@ -58,7 +63,7 @@ def load_dataframe(source,
                    msrp_col: Optional[str] = None,
                    cost_col: Optional[str] = None,
                    state_col: Optional[str] = None) -> pd.DataFrame:
-    """Load CSV/XLSX from a path or a file-like (Streamlit UploadedFile)."""
+    """Load CSV/XLSX from a path OR a file-like (e.g., Streamlit UploadedFile)."""
     if isinstance(source, str):
         name = source.lower()
         if name.endswith(".csv"):
@@ -79,6 +84,7 @@ def load_dataframe(source,
                 source.seek(0)
 
     cols = list(src.columns)
+    # Validate explicit mappings if provided
     missing = []
     if msrp_col and msrp_col not in cols:   missing.append(f"MSRP='{msrp_col}'")
     if cost_col and cost_col not in cols:   missing.append(f"Cost to ULP='{cost_col}'")
@@ -100,8 +106,10 @@ def load_dataframe(source,
     df["Cost_to_ULP"] = pd.to_numeric(df["Cost_to_ULP"], errors="coerce")
     df["Destination_State"] = df["Destination_State"].astype(str).str.strip().str.upper()
 
-    df = df.dropna(subset=["MSRP", "Cost_to_ULP", "Destination_State"])
-    df = df[(df["MSRP"] > 0) & (df["Cost_to_ULP"] > 0)].copy()
+    df = df.dropna(subset=["MSRP", "Destination_State"])
+    df = df[(df["MSRP"] > 0)]
+    # Cost_to_ULP may be missing in quoting datasets; keep rows and compute prices without it
+    df.loc[:, "Cost_to_ULP"] = pd.to_numeric(df.get("Cost_to_ULP", np.nan), errors="coerce")
     return df
 
 # ============================
@@ -115,7 +123,7 @@ def _zone_labels(n: int) -> List[str]:
 
 def _assign_zones(df: pd.DataFrame, zones: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
     state_stats = (
-        df.assign(cost_ratio=df["Cost_to_ULP"]/df["MSRP"])
+        df.assign(cost_ratio=(df["Cost_to_ULP"].fillna(0.0) / df["MSRP"]))
           .groupby("Destination_State")
           .agg(Count=("Destination_State","size"),
                Median_Cost_Ratio=("cost_ratio","median"))
@@ -188,20 +196,30 @@ def _evaluate(dfz: pd.DataFrame,
     a = np.array([mults_ab.get(k, (1.0, 0.0))[0] for k in key], float)
     b = np.array([mults_ab.get(k, (1.0, 0.0))[1] for k in key], float)
     b = np.clip(b, -b_cap, b_cap)
-    m = np.clip(a + b * dfz["MSRP_Norm"].values, 0.2, 5.0)
+
+    # Multiplier shape with (a, b) and optional c_state
+    m = a + b * dfz["MSRP_Norm"].values
     if c_state is not None:
         c = dfz["Destination_State"].map(c_state).fillna(0.0).values
-        m = np.clip(m + c, 0.2, 5.0)
+        m = m + c
+
+    # If using cost-free guard here, clamp m to [1+low, 1+high]
+    if guard is not None:
+        low, high = guard
+        m = np.minimum(np.maximum(m, 1.0 + low), 1.0 + high)
+
+    # Bound multiplier to a sane range
+    m = np.clip(m, 0.2, 5.0)
 
     price = dfz["MSRP"].values * dfz["Adj_Zone_Ratio"].values * m
 
-    # Optional band guard at price time
-    if guard is not None:
-        low, high = guard
-        cost = dfz["Cost_to_ULP"].values
-        price = np.minimum(np.maximum(price, cost*(1.0 + low)), cost*(1.0 + high))
+    # Margin vs ACTUAL cost if provided; else vs estimated cost basis (Adj_Zone_Ratio)
+    cost = dfz["Cost_to_ULP"].values
+    has_cost = np.isfinite(cost) & (cost > 0)
+    est_cost = dfz["MSRP"].values * dfz["Adj_Zone_Ratio"].values
+    base_cost = np.where(has_cost, cost, est_cost)
 
-    margin = (price - dfz["Cost_to_ULP"].values) / dfz["Cost_to_ULP"].values
+    margin = (price - base_cost) / base_cost
     return pd.Series(price, index=dfz.index), pd.Series(margin, index=dfz.index)
 
 # ============================
@@ -209,7 +227,12 @@ def _evaluate(dfz: pd.DataFrame,
 # ============================
 def build_zones_and_tiers(df: pd.DataFrame, params: CalibParams):
     state_stats, zone_ratio = _assign_zones(df, params.zones)
-    global_ratio = df["Cost_to_ULP"].sum() / df["MSRP"].sum()
+
+    # If cost missing in many rows, build global ratio on observed costs only; fallback to median(cost/msrp)
+    if df["Cost_to_ULP"].notna().any():
+        global_ratio = df["Cost_to_ULP"].fillna(0).sum() / df["MSRP"].sum()
+    else:
+        global_ratio = float(np.median((df["Cost_to_ULP"].fillna(0.0) / df["MSRP"]).replace([np.inf, -np.inf], np.nan).fillna(0.5)))
 
     dfz = df.merge(state_stats[["Destination_State","Zone"]], on="Destination_State", how="left")
     dfz = dfz.merge(zone_ratio, on="Zone", how="left")
@@ -217,18 +240,17 @@ def build_zones_and_tiers(df: pd.DataFrame, params: CalibParams):
     # Stabilized zone cost ratio used for pricing
     dfz["Adj_Zone_Ratio"] = params.shrinkage * dfz["Zone_Expected_Cost_Ratio"] + (1 - params.shrinkage) * global_ratio
 
-    # Tiers
+    # Tiers + tier normalization
     tier_series, tier_labels, breaks = _assign_tiers(dfz["MSRP"], params.msrp_breaks, params.tiers)
     dfz["Tier"] = tier_series
 
-    # Tier normalization (mid, width)
     rows = []
     for lab in tier_labels:
         g = dfz[dfz["Tier"] == lab]
         if g.empty:
             mid, width = 0.0, 1.0
         else:
-            w = g["Cost_to_ULP"].values
+            w = np.where(g["Cost_to_ULP"].fillna(0) > 0, g["Cost_to_ULP"].fillna(0), 1.0)
             v = g["MSRP"].values
             mid = _weighted_quantile(v, w, 0.5)
             p10 = _weighted_quantile(v, w, 0.10)
@@ -253,16 +275,25 @@ def calibrate(dfz: pd.DataFrame,
               prev_multipliers: Optional[Dict[Tuple[str,str], Tuple[float,float]]] = None):
     keys = sorted(set(zip(dfz["Zone"], dfz["Tier"])))
     mults = {k: (1.0 + params.target_mean, 0.0) for k in keys}
-    w = np.where(dfz["Cost_to_ULP"] > 0, dfz["Cost_to_ULP"], 1.0)
+
+    w = np.where(dfz["Cost_to_ULP"].fillna(0) > 0, dfz["Cost_to_ULP"].fillna(0), 1.0)
 
     # Initialize per-state correction (small & shrunk)
     c_state = {s: 0.0 for s in dfz["Destination_State"].unique()} if params.with_c_state else None
 
     for _ in range(params.iters):
-        price, marg = _evaluate(dfz, mults, c_state=c_state, b_cap=params.b_cap)
+        # Cost-free guard can be applied inside training to bias toward band
+        guard_tuple = (params.band_low, params.band_high) if (params.guard_low is None and params.guard_high is None) else (params.guard_low, params.guard_high)
+        price, marg = _evaluate(dfz, mults, c_state=c_state, b_cap=params.b_cap, guard=None)  # train without clamp for honest gradients
 
-        # Global centering to target mean
-        target_rev = dfz["Cost_to_ULP"].sum() * (1 + params.target_mean)
+        # Global centering to target mean (where cost exists we use true cost, else est_cost baseline)
+        # Compute revenue vs observed/estimated cost base
+        target_rev = dfz["Cost_to_ULP"].fillna(0).sum() * (1 + params.target_mean)
+        # If many costs are missing, fallback to est_cost base for centering
+        if target_rev == 0:
+            est_cost_total = float((dfz["MSRP"] * dfz["Adj_Zone_Ratio"]).sum())
+            target_rev = est_cost_total * (1 + params.target_mean)
+
         cur_rev = float(price.sum())
         if cur_rev != 0:
             step = 1.0 + params.lr_mean * ((target_rev / cur_rev) - 1.0)
@@ -328,9 +359,18 @@ def normalize_total(dfz: pd.DataFrame,
                     mults: Dict[Tuple[str,str], Tuple[float,float]],
                     c_state: Optional[Dict[str,float]],
                     params: CalibParams) -> Dict[Tuple[str,str], Tuple[float,float]]:
-    """Final normalization: hit exact target Σprice == Σcost × (1+target)."""
-    price, _ = _evaluate(dfz, mults, c_state=c_state, b_cap=params.b_cap)
-    target_rev = dfz["Cost_to_ULP"].sum() * (1 + params.target_mean)
+    """Final normalization: hit exact target Σprice == Σcost × (1+target) if costs exist,
+       otherwise use Σ(est_cost) × (1+target)."""
+    # Compute price and determine centering base
+    price, _ = _evaluate(dfz, mults, c_state=c_state, b_cap=params.b_cap, guard=None)
+    if dfz["Cost_to_ULP"].notna().any():
+        base = dfz["Cost_to_ULP"].fillna(0).sum()
+        if base == 0:
+            base = float((dfz["MSRP"] * dfz["Adj_Zone_Ratio"]).sum())
+    else:
+        base = float((dfz["MSRP"] * dfz["Adj_Zone_Ratio"]).sum())
+
+    target_rev = base * (1 + params.target_mean)
     scale = float(target_rev / price.sum()) if price.sum() else 1.0
     return {k: (a*scale, b*scale) for k,(a,b) in mults.items()}
 
@@ -342,17 +382,26 @@ def score(dfz: pd.DataFrame,
           params: CalibParams,
           c_state: Optional[Dict[str,float]] = None,
           apply_guard: bool = False) -> dict:
-    guard = (params.band_low, params.band_high) if apply_guard and params.guard_low is None else None
-    if apply_guard and (params.guard_low is not None and params.guard_high is not None):
-        guard = (params.guard_low, params.guard_high)
+    # Cost-free guard during scoring (multiplier clamp) if requested
+    guard = None
+    if apply_guard:
+        gl = params.guard_low if params.guard_low is not None else params.band_low
+        gh = params.guard_high if params.guard_high is not None else params.band_high
+        guard = (gl, gh)
 
     price, marg = _evaluate(dfz, mults, c_state=c_state, b_cap=params.b_cap, guard=guard)
 
-    total_cost = float(dfz["Cost_to_ULP"].sum())
+    # Base cost for metrics: use true cost where available else estimated
+    cost = dfz["Cost_to_ULP"].values
+    has_cost = np.isfinite(cost) & (cost > 0)
+    est_cost = (dfz["MSRP"] * dfz["Adj_Zone_Ratio"]).values
+    base_cost = np.where(has_cost, cost, est_cost)
+
+    total_cost = float(base_cost.sum())
     total_rev  = float(price.sum())
     mean_w = (total_rev / total_cost - 1.0) if total_cost > 0 else float("nan")
 
-    w = np.where(dfz["Cost_to_ULP"] > 0, dfz["Cost_to_ULP"], 1.0)
+    w = base_cost
     wsum = w.sum() or 1.0
     inside_w = float(w[(marg >= params.band_low) & (marg <= params.band_high)].sum() / wsum)
     below_w  = float(w[marg < params.band_low].sum() / wsum)
@@ -374,7 +423,7 @@ def score(dfz: pd.DataFrame,
 # ============================
 def build_version(df: pd.DataFrame,
                   params: CalibParams,
-                  prev: Optional[dict] = None) -> Tuple[dict, pd.DataFrame, pd.DataFrame]:
+                  prev: Optional[dict] = None):
     state_stats, zone_ratio, dfz, tnorm, breaks, labels, global_ratio = build_zones_and_tiers(df, params)
 
     prev_mults = None
@@ -389,14 +438,14 @@ def build_version(df: pd.DataFrame,
     mults, c_state = calibrate(dfz, params, prev_multipliers=prev_mults)
     mults = normalize_total(dfz, mults, c_state, params)
 
-    # Metrics (without and with guard so you can preview both)
+    # Metrics (without and with cost-free guard)
     metrics_no_guard = score(dfz, mults, params, c_state=c_state, apply_guard=False)
     metrics_guard    = score(dfz, mults, params, c_state=c_state, apply_guard=True)
 
     # Zone table (stabilized ratio actually used)
     zone_table = dfz.groupby("Zone").apply(
         lambda g: pd.Series({"Zone_Expected_Cost_Ratio":
-                             float(np.average(g["Adj_Zone_Ratio"], weights=g["Cost_to_ULP"]))})
+                             float(np.average(g["Adj_Zone_Ratio"], weights=np.where(g["Cost_to_ULP"].fillna(0)>0, g["Cost_to_ULP"].fillna(0), 1.0)))})
     ).reset_index()
 
     state_map = state_stats[["Destination_State","Zone"]].copy()
@@ -432,7 +481,7 @@ def build_version(df: pd.DataFrame,
         ],
         "zt_multipliers": zt_rows,
         "state_adjust": state_adjust,
-        # If guard_low/high are set in params, persist a guard block for runtime
+        # Persist guard (used by price_for multiplier clamp; and by price_for_with_cost if cost is known)
         "guard": (
             {"low": params.guard_low, "high": params.guard_high}
             if (params.guard_low is not None and params.guard_high is not None)
@@ -479,12 +528,13 @@ def _state_adjust_lookup(version: dict, state: str) -> float:
     return version["_state_adjust_index"].get(state, 0.0)
 
 def price_for(msrp: float, state: str, version: dict) -> float:
-    """Compute price for a single (MSRP, state) using the learned model + optional guard."""
+    """Compute price for a single (MSRP, state) with NO true cost, using multiplier clamp guard."""
     state = str(state).strip().upper()
 
     # map state -> zone
     if "_state_index" not in version:
         version["_state_index"] = {r["state"]: r["zone"] for r in version.get("state_map", [])}
+    # fallback to first zone if unseen state
     zone = version["_state_index"].get(state, version["zones"][0]["zone"])
 
     # stabilized zone expected ratio
@@ -502,24 +552,21 @@ def price_for(msrp: float, state: str, version: dict) -> float:
     # multipliers
     a, b = _mult_lookup_ab(version, zone, tier)
     c = _state_adjust_lookup(version, state)
-    m = max(0.2, min(5.0, a + b*x + c))
+    m = a + b*x + c
 
-    price = float(msrp) * float(zrat) * float(m)
-
-    # Optional runtime guard
+    # Cost-free guard → clamp multiplier to [1+low, 1+high]
     guard = version.get("guard")
     if guard and guard.get("low") is not None and guard.get("high") is not None:
-        # We need cost to enforce guard precisely. If unavailable at runtime, you can skip this clip.
-        # If you pass cost in, use price_for_with_cost below.
-        pass
+        m = max(1.0 + float(guard["low"]), min(1.0 + float(guard["high"]), m))
 
-    return price
+    m = max(0.2, min(5.0, m))
+    return float(msrp) * float(zrat) * float(m)
 
 def price_for_with_cost(msrp: float, cost_to_ulp: float, state: str, version: dict) -> float:
-    """Same as price_for, but applies guard exactly since cost is provided."""
+    """If true cost is available, we can apply an exact guard vs cost."""
     p = price_for(msrp, state, version)
     guard = version.get("guard")
-    if guard and guard.get("low") is not None and guard.get("high") is not None:
+    if guard and guard.get("low") is not None and guard.get("high") is not None and cost_to_ulp and cost_to_ulp > 0:
         lo = cost_to_ulp * (1.0 + float(guard["low"]))
         hi = cost_to_ulp * (1.0 + float(guard["high"]))
         p = min(max(p, lo), hi)
