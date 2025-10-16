@@ -6,7 +6,14 @@ if APP_ROOT not in sys.path:
 import io
 import pandas as pd
 import streamlit as st
-from src.model import load_dataframe, CalibParams, build_version
+mport streamlit as st
+try:
+    from src.model import load_dataframe, CalibParams, build_version, price_for, price_for_many
+except Exception as e:
+    import traceback
+    st.error("Import failed in Admin page.")
+    st.code(traceback.format_exc())
+    st.stop()
 from src.storage import save_upload, publish_version, list_versions, load_version
 from src.ui import zone_table_component, metrics_cards
 
