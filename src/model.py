@@ -200,3 +200,4 @@ def build_version(df: pd.DataFrame, params: CalibParams, prev: dict|None=None) -
         ]
     }
     return version, state_map, zone_table
+
