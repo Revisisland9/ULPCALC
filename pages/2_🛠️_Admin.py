@@ -1,4 +1,8 @@
 # pages/2_🛠️_Admin.py
+import os, sys
+APP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if APP_ROOT not in sys.path:
+    sys.path.insert(0, APP_ROOT)
 import io
 import pandas as pd
 import streamlit as st
